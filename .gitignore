@@ -1,0 +1,23 @@
+# Dependencies
+node_modules
+
+
+# Data
+database.json
+
+# Utility scripts
+gen_pass.js
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode
+.idea
