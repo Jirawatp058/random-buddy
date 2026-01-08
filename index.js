@@ -1,5 +1,5 @@
 const express = require('express');
-const { kv } = require('@vercel/kv'); // ใช้ Vercel KV
+const { createClient } = require('redis');
 const app = express();
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
@@ -12,25 +12,39 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const ADMIN_PASSWORD = 'Outing_random_buddy'; // 🔑 รหัสเข้าหน้าแอดมิน (เปลี่ยนได้)
 
 // ==========================================
-// 💾 Database Helper (ระบบจัดการ KV)
+// 💾 Database Helper (Redis Client)
 // ==========================================
+const client = createClient({
+    url: process.env.REDIS_URL
+});
+
+client.on('error', err => console.log('Redis Client Error', err));
+
+async function connectRedis() {
+    if (!client.isOpen) {
+        await client.connect();
+    }
+}
+
 async function getDB() {
-    const data = await kv.get('db');
+    await connectRedis();
+    const data = await client.get('db');
     if (!data) {
-        // ค่าเริ่มต้น ถ้ายังไม่มีข้อมูลใน KV
+        // ค่าเริ่มต้น ถ้ายังไม่มีข้อมูลใน Redis
         const initialData = {
             state: 'REGISTRATION', // REGISTRATION หรือ MATCHED
             users: [], // { name, password, exclude: [] }
             matches: null // จะเก็บเป็น base64
         };
-        await kv.set('db', initialData);
+        await client.set('db', JSON.stringify(initialData));
         return initialData;
     }
-    return data;
+    return JSON.parse(data);
 }
 
 async function saveDB(data) {
-    await kv.set('db', data);
+    await connectRedis();
+    await client.set('db', JSON.stringify(data));
 }
 
 // ==========================================
