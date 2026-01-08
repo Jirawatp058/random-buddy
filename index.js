@@ -1,5 +1,5 @@
 const express = require('express');
-const fs = require('fs');
+const { kv } = require('@vercel/kv'); // ใช้ Vercel KV
 const app = express();
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
@@ -9,28 +9,28 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // ==========================================
 // ⚙️ ตั้งค่าระบบ
 // ==========================================
-const DB_FILE = 'database.json';
 const ADMIN_PASSWORD = 'Outing_random_buddy'; // 🔑 รหัสเข้าหน้าแอดมิน (เปลี่ยนได้)
 
 // ==========================================
-// 💾 Database Helper (ระบบจัดการไฟล์)
+// 💾 Database Helper (ระบบจัดการ KV)
 // ==========================================
-function getDB() {
-    if (!fs.existsSync(DB_FILE)) {
-        // ค่าเริ่มต้น ถ้ายังไม่มีไฟล์
+async function getDB() {
+    const data = await kv.get('db');
+    if (!data) {
+        // ค่าเริ่มต้น ถ้ายังไม่มีข้อมูลใน KV
         const initialData = {
             state: 'REGISTRATION', // REGISTRATION หรือ MATCHED
             users: [], // { name, password, exclude: [] }
             matches: null // จะเก็บเป็น base64
         };
-        fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2));
+        await kv.set('db', initialData);
         return initialData;
     }
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
+    return data;
 }
 
-function saveDB(data) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+async function saveDB(data) {
+    await kv.set('db', data);
 }
 
 // ==========================================
@@ -107,8 +107,8 @@ const style = `
 // ==========================================
 
 // 1. หน้าแรก (เปลี่ยนตามสถานะ)
-app.get('/', (req, res) => {
-    const db = getDB();
+app.get('/', async (req, res) => {
+    const db = await getDB();
     const showPopup = req.query.registered === '1';
     const popupHtml = showPopup ? `
         <div class="popup-overlay" onclick="window.history.replaceState({}, document.title, '/'); this.remove();">
@@ -209,8 +209,8 @@ app.get('/', (req, res) => {
 });
 
 // 2. API ลงทะเบียน
-app.post('/register', (req, res) => {
-    const db = getDB();
+app.post('/register', async (req, res) => {
+    const db = await getDB();
     if (db.state !== 'REGISTRATION') return res.send('ปิดรับสมัครแล้ว');
 
     const { name, password, sizeType, sizeStd, sizeInch } = req.body;
@@ -227,7 +227,7 @@ app.post('/register', (req, res) => {
 
     // บันทึก user
     db.users.push({ name, password: hashPassword(password), size, exclude: [] });
-    saveDB(db);
+    await saveDB(db);
     res.redirect('/?registered=1');
 });
 
@@ -247,11 +247,11 @@ app.get('/admin', (req, res) => {
 });
 
 // 4. หน้า Admin Dashboard (จัดการคน + จับคู่)
-app.post('/admin/dashboard', (req, res) => {
+app.post('/admin/dashboard', async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) return res.send('Wrong Password');
 
-    const db = getDB();
+    const db = await getDB();
     
     // สร้าง Dropdown รายชื่อ
     const options = db.users.map(u => `<option value="${u.name}">${u.name}</option>`).join('');
@@ -346,9 +346,9 @@ app.post('/admin/dashboard', (req, res) => {
 });
 
 // 5. API เพิ่มเงื่อนไขแฟน
-app.post('/admin/add-exclude', (req, res) => {
+app.post('/admin/add-exclude', async (req, res) => {
     const { user1, user2, password } = req.body;
-    const db = getDB();
+    const db = await getDB();
 
     if (user1 && user2 && user1 !== user2) {
         // เพิ่มเงื่อนไขทั้งสองฝั่ง (ไป-กลับ)
@@ -358,16 +358,16 @@ app.post('/admin/add-exclude', (req, res) => {
         if (u1 && !u1.exclude.includes(user2)) u1.exclude.push(user2);
         if (u2 && !u2.exclude.includes(user1)) u2.exclude.push(user1);
         
-        saveDB(db);
+        await saveDB(db);
     }
     // Hack: ส่งกลับไปหน้า Dashboard โดยแปะ password ไปด้วย (แบบบ้านๆ)
     res.send(`<form id="f" action="/admin/dashboard" method="POST"><input type="hidden" name="password" value="${password}"></form><script>document.getElementById("f").submit()</script>`);
 });
 
 // APIs ลบเงื่อนไขแฟน
-app.post('/admin/remove-exclude', (req, res) => {
+app.post('/admin/remove-exclude', async (req, res) => {
     const { user1, user2, password } = req.body;
-    const db = getDB();
+    const db = await getDB();
 
     if (user1 && user2) {
         const u1 = db.users.find(u => u.name === user1);
@@ -376,16 +376,16 @@ app.post('/admin/remove-exclude', (req, res) => {
         if (u1) u1.exclude = u1.exclude.filter(n => n !== user2);
         if (u2) u2.exclude = u2.exclude.filter(n => n !== user1);
 
-        saveDB(db);
+        await saveDB(db);
     }
     // Hack: ส่งกลับไปหน้า Dashboard
     res.send(`<form id="f" action="/admin/dashboard" method="POST"><input type="hidden" name="password" value="${password}"></form><script>document.getElementById("f").submit()</script>`);
 });
 
 // APIs ลบ User
-app.post('/admin/remove-user', (req, res) => {
+app.post('/admin/remove-user', async (req, res) => {
     const { name, password } = req.body;
-    const db = getDB();
+    const db = await getDB();
 
     if (name) {
         // ลบ User ออก
@@ -398,18 +398,18 @@ app.post('/admin/remove-user', (req, res) => {
             }
         });
 
-        saveDB(db);
+        await saveDB(db);
     }
     // Hack: ส่งกลับไปหน้า Dashboard
     res.send(`<form id="f" action="/admin/dashboard" method="POST"><input type="hidden" name="password" value="${password}"></form><script>document.getElementById("f").submit()</script>`);
 });
 
 // 6. API ประมวลผลจับคู่ (The Magic Moment)
-app.post('/admin/match', (req, res) => {
+app.post('/admin/match', async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) return res.send('Auth Failed');
+    const db = await getDB();
     
-    const db = getDB();
     if (db.state === 'MATCHED') return res.send('ระบบจับคู่ไปแล้ว ไม่สามารถจับคู่ซ้ำได้');
     if (db.users.length < 2) return res.send('คนน้อยไป จับคู่ไม่ได้');
 
@@ -427,17 +427,17 @@ app.post('/admin/match', (req, res) => {
     db.matches = encodedMatches;
     db.state = 'MATCHED';
     db.matchedAt = new Date().toISOString();
-    saveDB(db);
+    await saveDB(db);
 
     res.send(`${style}<div class="container"><h1>✅ จับคู่สำเร็จ!</h1><p>ระบบปิดรับสมัครแล้ว แจ้งให้ทุกคนเข้าเว็บมาดูผลได้เลย</p><a href="/">ไปหน้าแรก</a></div>`);
 });
 
 // 7. API ล้างระบบ (Reset)
-app.post('/admin/reset', (req, res) => {
+app.post('/admin/reset', async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) return res.send('Auth Failed');
 
-    const db = getDB();
+    const db = await getDB();
     
     // รีเซ็ตค่าต่างๆ แต่เก็บ users ไว้
     db.state = 'REGISTRATION';
@@ -449,15 +449,15 @@ app.post('/admin/reset', (req, res) => {
         delete u.checked;
     });
 
-    saveDB(db);
+    await saveDB(db);
     
     res.send(`${style}<div class="container"><h1>🗑️ ล้างระบบเรียบร้อย</h1><p>พร้อมสำหรับเริ่มเกมใหม่แล้ว</p><a href="/">ไปหน้าแรก</a></div>`);
 });
 
 // 8. API User ดูผล
-app.post('/check', (req, res) => {
+app.post('/check', async (req, res) => {
     const { name, password } = req.body;
-    const db = getDB();
+    const db = await getDB();
     
     // ตรวจสอบ Login
     const user = db.users.find(u => u.name === name);
@@ -477,7 +477,7 @@ app.post('/check', (req, res) => {
     // บันทึกว่าเข้ามาดูแล้ว
     if (!user.checked) {
         user.checked = true;
-        saveDB(db);
+        await saveDB(db);
     }
 
     res.send(`
@@ -501,6 +501,10 @@ app.post('/check', (req, res) => {
     `);
 });
 
-app.listen(3000, '0.0.0.0', () => {
-    console.log('Server started on port 3000');
-});
+module.exports = app;
+
+if (require.main === module) {
+    app.listen(3000, '0.0.0.0', () => {
+        console.log('Server started on port 3000');
+    });
+}
