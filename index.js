@@ -1,5 +1,5 @@
 const express = require('express');
-const { createClient } = require('redis');
+
 const app = express();
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
@@ -11,40 +11,103 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // ==========================================
 const ADMIN_PASSWORD = 'Outing_random_buddy'; // 🔑 รหัสเข้าหน้าแอดมิน (เปลี่ยนได้)
 
-// ==========================================
-// 💾 Database Helper (Redis Client)
-// ==========================================
+
+const { createClient } = require('@libsql/client');
+
 const client = createClient({
-    url: process.env.REDIS_URL
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN
 });
 
-client.on('error', err => console.log('Redis Client Error', err));
+// Ensure Tables Exist
+let isDBInitialized = false;
+async function initDB() {
+    if (isDBInitialized) return;
+    try {
+        await client.batch([
+            `CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT)`,
+            `CREATE TABLE IF NOT EXISTS users (name TEXT PRIMARY KEY, password TEXT, size TEXT, buddy TEXT, checked INTEGER DEFAULT 0)`,
+            `CREATE TABLE IF NOT EXISTS exclusions (user1 TEXT, user2 TEXT, PRIMARY KEY (user1, user2))`
+        ], 'write');
+        
+        // Init default state if not exists
+        await client.execute({
+            sql: "INSERT OR IGNORE INTO system_config (key, value) VALUES ('state', 'REGISTRATION')",
+            args: []
+        });
 
-async function connectRedis() {
-    if (!client.isOpen) {
-        await client.connect();
+        isDBInitialized = true;
+    } catch (err) {
+        console.error("Failed to init DB:", err);
     }
 }
 
-async function getDB() {
-    await connectRedis();
-    const data = await client.get('db');
-    if (!data) {
-        // ค่าเริ่มต้น ถ้ายังไม่มีข้อมูลใน Redis
-        const initialData = {
-            state: 'REGISTRATION', // REGISTRATION หรือ MATCHED
-            users: [], // { name, password, exclude: [] }
-            matches: null // จะเก็บเป็น base64
-        };
-        await client.set('db', JSON.stringify(initialData));
-        return initialData;
-    }
-    return JSON.parse(data);
+// === DB Access Helpers ===
+
+async function getSystemState() {
+    await initDB();
+    const rs = await client.execute("SELECT value FROM system_config WHERE key = 'state'");
+    return rs.rows.length ? rs.rows[0].value : 'REGISTRATION';
 }
 
-async function saveDB(data) {
-    await connectRedis();
-    await client.set('db', JSON.stringify(data));
+async function setSystemState(state) {
+    await initDB();
+    await client.execute({
+        sql: "INSERT INTO system_config (key, value) VALUES ('state', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        args: [state]
+    });
+}
+
+async function getMatchedAt() {
+    await initDB();
+    const rs = await client.execute("SELECT value FROM system_config WHERE key = 'matched_at'");
+    return rs.rows.length ? rs.rows[0].value : null;
+}
+
+async function setMatchedAt(dateStr) {
+    await initDB();
+    // ถ้า dateStr เป็น null ให้ลบออก หรือ update เป็น null (แต่ value เป็น TEXT อาจจะเก็บ string 'null' หรือ empty)
+    if (!dateStr) {
+        await client.execute("DELETE FROM system_config WHERE key = 'matched_at'");
+    } else {
+        await client.execute({
+            sql: "INSERT INTO system_config (key, value) VALUES ('matched_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            args: [dateStr]
+        });
+    }
+}
+
+async function getAllUsers() {
+    await initDB();
+    const rs = await client.execute("SELECT * FROM users");
+    // แปลงให้ format ใกล้เคียงเดิม เพื่อให้แก้ logic น้อยที่สุด
+    // แต่จริงๆ ควรแก้ logic ให้ match กับ sql
+    // Return เป็น array ของ object
+    return rs.rows; 
+}
+
+// เอา exclusion ของ user คนนึง
+async function getUserExclusions(name) {
+    await initDB();
+    const rs = await client.execute({
+        sql: "SELECT user2 FROM exclusions WHERE user1 = ?",
+        args: [name]
+    });
+    return rs.rows.map(r => r.user2);
+}
+
+// ดึง Users พร้อม Exclude array (สำหรับ logic เดิมที่ต้องการ exclude array ในตัว object)
+async function getUsersWithExclusions() {
+    const users = await getAllUsers();
+    // fetch all exclusions
+    const rsEx = await client.execute("SELECT * FROM exclusions");
+    
+    // Map exclusions to users
+    const usersWithEx = users.map(u => ({
+        ...u,
+        exclude: rsEx.rows.filter(e => e.user1 === u.name).map(e => e.user2)
+    }));
+    return usersWithEx;
 }
 
 // ==========================================
@@ -121,8 +184,9 @@ const style = `
 // ==========================================
 
 // 1. หน้าแรก (เปลี่ยนตามสถานะ)
+// 1. หน้าแรก (เปลี่ยนตามสถานะ)
 app.get('/', async (req, res) => {
-    const db = await getDB();
+    const state = await getSystemState();
     const showPopup = req.query.registered === '1';
     const popupHtml = showPopup ? `
         <div class="popup-overlay" onclick="window.history.replaceState({}, document.title, '/'); this.remove();">
@@ -135,9 +199,10 @@ app.get('/', async (req, res) => {
         </div>
     ` : '';
     
-    if (db.state === 'REGISTRATION') {
+    if (state === 'REGISTRATION') {
+        const users = await getAllUsers();
         // แสดงหน้าลงทะเบียน
-        const userList = db.users.map(u => `<span class="tag">${u.name}</span>`).join(' ');
+        const userList = users.map(u => `<span class="tag">${u.name}</span>`).join(' ');
         res.send(`
             ${style}
             ${popupHtml}
@@ -199,7 +264,7 @@ app.get('/', async (req, res) => {
                     toggleSize();
                 </script>
                 <hr>
-                <p>ผู้เข้าร่วม (${db.users.length} คน):</p>
+                <p>ผู้เข้าร่วม (${users.length} คน):</p>
                 <div>${userList || '- ยังไม่มีคนสมัคร -'}</div>
                 <br>
                 <a href="/admin"><button class="admin-btn">🔒 เข้าสู่ระบบ Admin</button></a>
@@ -224,8 +289,8 @@ app.get('/', async (req, res) => {
 
 // 2. API ลงทะเบียน
 app.post('/register', async (req, res) => {
-    const db = await getDB();
-    if (db.state !== 'REGISTRATION') return res.send('ปิดรับสมัครแล้ว');
+    const state = await getSystemState();
+    if (state !== 'REGISTRATION') return res.send('ปิดรับสมัครแล้ว');
 
     const { name, password, sizeType, sizeStd, sizeInch } = req.body;
     
@@ -234,15 +299,22 @@ app.post('/register', async (req, res) => {
         size = sizeInch ? `รอบอก ${sizeInch} นิ้ว` : 'ไม่ระบุ';
     }
     
-    // เช็คชื่อซ้ำ
-    if (db.users.find(u => u.name === name)) {
-        return res.send(`${style}<div class="container"><h3>❌ ชื่อนี้มีคนใช้แล้ว</h3><a href="/">กลับ</a></div>`);
+    // Insert into DB
+    await initDB();
+    try {
+        await client.execute({
+            sql: "INSERT INTO users (name, password, size) VALUES (?, ?, ?)",
+            args: [name, hashPassword(password), size]
+        });
+        res.redirect('/?registered=1');
+    } catch (e) {
+        // Check if name duplicate (SQLITE_CONSTRAINT)
+        if (e.message.includes('CONSTRAINT') || e.code === 'SQLITE_CONSTRAINT') {
+            return res.send(`${style}<div class="container"><h3>❌ ชื่อนี้มีคนใช้แล้ว</h3><a href="/">กลับ</a></div>`);
+        }
+        console.error(e);
+        res.send("Error registering");
     }
-
-    // บันทึก user
-    db.users.push({ name, password: hashPassword(password), size, exclude: [] });
-    await saveDB(db);
-    res.redirect('/?registered=1');
 });
 
 // 3. หน้า Admin Login
@@ -265,29 +337,36 @@ app.post('/admin/dashboard', async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) return res.send('Wrong Password');
 
-    const db = await getDB();
+    const users = await getUsersWithExclusions();
+    const state = await getSystemState();
+    const matchedAt = await getMatchedAt();
     
     // สร้าง Dropdown รายชื่อ
-    const options = db.users.map(u => `<option value="${u.name}">${u.name}</option>`).join('');
+    const options = users.map(u => `<option value="${u.name}">${u.name}</option>`).join('');
     
-    // สร้างรายการ Exclusion (ใครห้ามคู่ใคร)
+    // สร้างรายการ Exclusion
     let excludeList = '';
-    db.users.forEach(u => {
+    // Display Unique Pairs only to avoid duplicates in view
+    const viewedPairs = new Set();
+
+    users.forEach(u => {
         if (u.exclude && u.exclude.length > 0) {
             u.exclude.forEach(targetName => {
-                // แสดงเฉพาะขาเดียว (A -> B) เพื่อไม่ให้ซ้ำซ้อน
-                if (u.name < targetName) {
-                    excludeList += `
-                        <li style="margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center;">
-                            <span><b>${u.name}</b> ❌ <b>${targetName}</b></span>
-                            <form action="/admin/remove-exclude" method="POST" style="margin:0;">
-                                <input type="hidden" name="password" value="${password}">
-                                <input type="hidden" name="user1" value="${u.name}">
-                                <input type="hidden" name="user2" value="${targetName}">
-                                <button type="submit" style="background:#dc3545; padding:2px 8px; font-size:12px; width:auto; margin:0;">ลบ</button>
-                            </form>
-                        </li>`;
-                }
+                // Determine unique pair key (sorted)
+                const pair = [u.name, targetName].sort().join(':');
+                if (viewedPairs.has(pair)) return;
+                viewedPairs.add(pair);
+
+                excludeList += `
+                    <li style="margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center;">
+                        <span><b>${u.name}</b> ❌ <b>${targetName}</b></span>
+                        <form action="/admin/remove-exclude" method="POST" style="margin:0;">
+                            <input type="hidden" name="password" value="${password}">
+                            <input type="hidden" name="user1" value="${u.name}">
+                            <input type="hidden" name="user2" value="${targetName}">
+                            <button type="submit" style="background:#dc3545; padding:2px 8px; font-size:12px; width:auto; margin:0;">ลบ</button>
+                        </form>
+                    </li>`;
             });
         }
     });
@@ -296,12 +375,12 @@ app.post('/admin/dashboard', async (req, res) => {
         ${style}
         <div class="container" style="max-width:600px;">
             <h1>🛠️ จัดการระบบ</h1>
-            <p>สถานะ: <b>${db.state}</b> | ผู้เล่น: ${db.users.length} คน</p>
+            <p>สถานะ: <b>${state}</b> | ผู้เล่น: ${users.length} คน</p>
             
             <details style="margin-bottom: 20px; background: #fff; border: 1px solid #ddd; padding: 10px; border-radius: 8px;">
-                <summary style="cursor: pointer; font-weight: bold;">รายชื่อผู้เข้าร่วม (${db.users.length})</summary>
+                <summary style="cursor: pointer; font-weight: bold;">รายชื่อผู้เข้าร่วม (${users.length})</summary>
                 <ul style="text-align: left; padding-left: 20px; margin-top: 10px;">
-                    ${db.users.map(u => `
+                    ${users.map(u => `
                         <li style="margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center;">
                             <span>
                                 ${u.name} (${u.size})
@@ -331,9 +410,9 @@ app.post('/admin/dashboard', async (req, res) => {
 
             <hr>
             <hr>
-            ${db.state === 'MATCHED' ? `
+            ${state === 'MATCHED' ? `
                 <h3>✅ จับคู่เรียบร้อยแล้ว</h3>
-                <p>เมื่อ: <b>${db.matchedAt ? new Date(db.matchedAt).toLocaleString('th-TH') : 'ไม่ระบุเวลา'}</b></p>
+                <p>เมื่อ: <b>${matchedAt ? new Date(matchedAt).toLocaleString('th-TH') : 'ไม่ระบุเวลา'}</b></p>
                 <div style="background:#d4edda; color:#155724; padding:15px; border-radius:8px; margin-top:10px;">
                     ระบบปิดรับสมัครและจับคู่เสร็จสิ้นแล้ว
                 </div>
@@ -362,59 +441,56 @@ app.post('/admin/dashboard', async (req, res) => {
 // 5. API เพิ่มเงื่อนไขแฟน
 app.post('/admin/add-exclude', async (req, res) => {
     const { user1, user2, password } = req.body;
-    const db = await getDB();
+    await initDB();
 
     if (user1 && user2 && user1 !== user2) {
         // เพิ่มเงื่อนไขทั้งสองฝั่ง (ไป-กลับ)
-        const u1 = db.users.find(u => u.name === user1);
-        const u2 = db.users.find(u => u.name === user2);
-        
-        if (u1 && !u1.exclude.includes(user2)) u1.exclude.push(user2);
-        if (u2 && !u2.exclude.includes(user1)) u2.exclude.push(user1);
-        
-        await saveDB(db);
+        try {
+            await client.batch([
+                { sql: "INSERT OR IGNORE INTO exclusions (user1, user2) VALUES (?, ?)", args: [user1, user2] },
+                { sql: "INSERT OR IGNORE INTO exclusions (user1, user2) VALUES (?, ?)", args: [user2, user1] }
+            ], 'write');
+        } catch (e) {
+            console.error(e);
+        }
     }
-    // Hack: ส่งกลับไปหน้า Dashboard โดยแปะ password ไปด้วย (แบบบ้านๆ)
+    // Hack: ส่งกลับไปหน้า Dashboard
     res.send(`<form id="f" action="/admin/dashboard" method="POST"><input type="hidden" name="password" value="${password}"></form><script>document.getElementById("f").submit()</script>`);
 });
 
 // APIs ลบเงื่อนไขแฟน
 app.post('/admin/remove-exclude', async (req, res) => {
     const { user1, user2, password } = req.body;
-    const db = await getDB();
+    await initDB();
 
     if (user1 && user2) {
-        const u1 = db.users.find(u => u.name === user1);
-        const u2 = db.users.find(u => u.name === user2);
-
-        if (u1) u1.exclude = u1.exclude.filter(n => n !== user2);
-        if (u2) u2.exclude = u2.exclude.filter(n => n !== user1);
-
-        await saveDB(db);
+        try {
+            await client.batch([
+                { sql: "DELETE FROM exclusions WHERE user1 = ? AND user2 = ?", args: [user1, user2] },
+                { sql: "DELETE FROM exclusions WHERE user1 = ? AND user2 = ?", args: [user2, user1] }
+            ], 'write');
+        } catch (e) {
+            console.error(e);
+        }
     }
-    // Hack: ส่งกลับไปหน้า Dashboard
     res.send(`<form id="f" action="/admin/dashboard" method="POST"><input type="hidden" name="password" value="${password}"></form><script>document.getElementById("f").submit()</script>`);
 });
 
 // APIs ลบ User
 app.post('/admin/remove-user', async (req, res) => {
     const { name, password } = req.body;
-    const db = await getDB();
+    await initDB();
 
     if (name) {
-        // ลบ User ออก
-        db.users = db.users.filter(u => u.name !== name);
-        
-        // ลบเงื่อนไขที่มีคนนี้เกี่ยวข้อง
-        db.users.forEach(u => {
-            if (u.exclude) {
-                u.exclude = u.exclude.filter(n => n !== name);
-            }
-        });
-
-        await saveDB(db);
+        try {
+            await client.batch([
+                { sql: "DELETE FROM users WHERE name = ?", args: [name] },
+                { sql: "DELETE FROM exclusions WHERE user1 = ? OR user2 = ?", args: [name, name] }
+            ], 'write');
+        } catch (e) {
+            console.error(e);
+        }
     }
-    // Hack: ส่งกลับไปหน้า Dashboard
     res.send(`<form id="f" action="/admin/dashboard" method="POST"><input type="hidden" name="password" value="${password}"></form><script>document.getElementById("f").submit()</script>`);
 });
 
@@ -422,26 +498,43 @@ app.post('/admin/remove-user', async (req, res) => {
 app.post('/admin/match', async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) return res.send('Auth Failed');
-    const db = await getDB();
     
-    if (db.state === 'MATCHED') return res.send('ระบบจับคู่ไปแล้ว ไม่สามารถจับคู่ซ้ำได้');
-    if (db.users.length < 2) return res.send('คนน้อยไป จับคู่ไม่ได้');
+    const state = await getSystemState();
+    if (state === 'MATCHED') return res.send('ระบบจับคู่ไปแล้ว ไม่สามารถจับคู่ซ้ำได้');
+    
+    const users = await getUsersWithExclusions();
+    if (users.length < 2) return res.send('คนน้อยไป จับคู่ไม่ได้');
 
     console.log('Admin สั่งจับคู่...');
-    const matches = generateMatches(db.users);
+    const matches = generateMatches(users); // Return { giverName: receiverName }
 
     if (!matches) {
         return res.send(`${style}<div class="container"><h3>❌ จับคู่ไม่สำเร็จ!</h3><p>เงื่อนไขเยอะเกินไป หรือจำนวนคนไม่สอดคล้อง ลองลบเงื่อนไขแฟนออกบ้าง</p><a href="/">กลับ</a></div>`);
     }
 
-    // เข้ารหัสผลลัพธ์เป็น Base64
-    const encodedMatches = Buffer.from(JSON.stringify(matches)).toString('base64');
+    // Update DB transactions
+    await initDB();
+    const stmts = [];
+    
+    // Update each user's buddy
+    for (const [giver, receiver] of Object.entries(matches)) {
+        stmts.push({
+            sql: "UPDATE users SET buddy = ? WHERE name = ?",
+            args: [receiver, giver]
+        });
+    }
 
-    // บันทึกและเปลี่ยนสถานะ
-    db.matches = encodedMatches;
-    db.state = 'MATCHED';
-    db.matchedAt = new Date().toISOString();
-    await saveDB(db);
+    // Update system state
+    const now = new Date().toISOString();
+    stmts.push({ sql: "INSERT OR REPLACE INTO system_config (key, value) VALUES ('state', 'MATCHED')", args: [] });
+    stmts.push({ sql: "INSERT OR REPLACE INTO system_config (key, value) VALUES ('matched_at', ?)", args: [now] });
+
+    try {
+        await client.batch(stmts, 'write');
+    } catch (e) {
+        console.error(e);
+        return res.send("Error saving matches");
+    }
 
     res.send(`${style}<div class="container"><h1>✅ จับคู่สำเร็จ!</h1><p>ระบบปิดรับสมัครแล้ว แจ้งให้ทุกคนเข้าเว็บมาดูผลได้เลย</p><a href="/">ไปหน้าแรก</a></div>`);
 });
@@ -451,19 +544,17 @@ app.post('/admin/reset', async (req, res) => {
     const { password } = req.body;
     if (password !== ADMIN_PASSWORD) return res.send('Auth Failed');
 
-    const db = await getDB();
-    
-    // รีเซ็ตค่าต่างๆ แต่เก็บ users ไว้
-    db.state = 'REGISTRATION';
-    db.matches = null;
-    delete db.matchedAt;
-    
-    // รีเซ็ตสถานะการดูผลของทุกคน
-    db.users.forEach(u => {
-        delete u.checked;
-    });
-
-    await saveDB(db);
+    await initDB();
+    try {
+        await client.batch([
+            "DELETE FROM users",
+            "DELETE FROM exclusions",
+            "INSERT OR REPLACE INTO system_config (key, value) VALUES ('state', 'REGISTRATION')",
+            "DELETE FROM system_config WHERE key = 'matched_at'"
+        ], 'write');
+    } catch (e) {
+        console.error(e);
+    }
     
     res.send(`${style}<div class="container"><h1>🗑️ ล้างระบบเรียบร้อย</h1><p>พร้อมสำหรับเริ่มเกมใหม่แล้ว</p><a href="/">ไปหน้าแรก</a></div>`);
 });
@@ -471,48 +562,56 @@ app.post('/admin/reset', async (req, res) => {
 // 8. API User ดูผล
 app.post('/check', async (req, res) => {
     const { name, password } = req.body;
-    const db = await getDB();
+    await initDB();
     
-    // ตรวจสอบ Login
-    const user = db.users.find(u => u.name === name);
-    if (!user || !verifyPassword(password, user.password)) {
-        return res.send(`${style}<div class="container"><h3>❌ ชื่อหรือรหัสผ่านผิด</h3><a href="/">ลองใหม่</a></div>`);
-    }
+    try {
+        // Fetch user info
+        const rsUser = await client.execute({ sql: "SELECT * FROM users WHERE name = ?", args: [name] });
+        if (rsUser.rows.length === 0) return res.send(`${style}<div class="container"><h3>❌ ไม่พบชื่อในระบบ</h3><a href="/">กลับ</a></div>`);
+        
+        const user = rsUser.rows[0];
 
-    // ถอดรหัสเฉพาะคู่นี้
-    if (!db.matches) return res.send('ระบบยังไม่จับคู่');
-    
-    const allMatches = JSON.parse(Buffer.from(db.matches, 'base64').toString('utf-8'));
-    const myBuddy = allMatches[name];
-    const buddyData = db.users.find(u => u.name === myBuddy);
+        if (!verifyPassword(password, user.password)) {
+            return res.send(`${style}<div class="container"><h3>❌ รหัสผ่านผิด</h3><a href="/">ลองใหม่</a></div>`);
+        }
 
-    const buddySize = buddyData ? buddyData.size : 'ไม่ระบุ';
+        // Check Match Status
+        const state = await getSystemState();
+        if (state !== 'MATCHED' || !user.buddy) return res.send('ระบบยังไม่จับคู่ หรือคุณไม่มีคู่');
+        
+        // Fetch Buddy Info to get size
+        const rsBuddy = await client.execute({ sql: "SELECT * FROM users WHERE name = ?", args: [user.buddy] });
+        const buddyData = rsBuddy.rows[0];
+        const buddySize = buddyData ? buddyData.size : 'ไม่ระบุ';
 
-    // บันทึกว่าเข้ามาดูแล้ว
-    if (!user.checked) {
-        user.checked = true;
-        await saveDB(db);
-    }
+        // Update checked status
+        if (!user.checked) {
+            await client.execute({ sql: "UPDATE users SET checked = 1 WHERE name = ?", args: [name] });
+        }
 
-    res.send(`
-        ${style}
-        <div class="container" style="background:#e8f5e9;">
-            <h1>🎉 ผลการจับคู่</h1>
-            <p>สวัสดีคุณ <b>${name}</b></p>
-            <p>บัดดี้ที่คุณต้องดูแลคือ...</p>
-            <h1 style="color:#2e7d32; font-size:45px; margin:20px 0; text-shadow: 1px 1px 2px rgba(0,0,0,0.1);">${myBuddy}</h1>
-            
-            <div style="background: white; padding: 15px; border-radius: 12px; margin: 20px 0; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
-                <span style="font-size: 14px; color: #666; display: block; margin-bottom: 5px;">สิ่งที่บัดดี้อยากได้ (ไซส์เสื้อ)</span>
-                <div style="font-size: 24px; color: #333; font-weight: bold;">
-                    👕 ${buddySize}
+        res.send(`
+            ${style}
+            <div class="container" style="background:#e8f5e9;">
+                <h1>🎉 ผลการจับคู่</h1>
+                <p>สวัสดีคุณ <b>${name}</b></p>
+                <p>บัดดี้ที่คุณต้องดูแลคือ...</p>
+                <h1 style="color:#2e7d32; font-size:45px; margin:20px 0; text-shadow: 1px 1px 2px rgba(0,0,0,0.1);">${user.buddy}</h1>
+                
+                <div style="background: white; padding: 15px; border-radius: 12px; margin: 20px 0; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
+                    <span style="font-size: 14px; color: #666; display: block; margin-bottom: 5px;">สิ่งที่บัดดี้อยากได้ (ไซส์เสื้อ)</span>
+                    <div style="font-size: 24px; color: #333; font-weight: bold;">
+                        👕 ${buddySize}
+                    </div>
                 </div>
-            </div>
 
-            <p style="color:#666; font-size: 14px;">🤫 เงียบไว้นะ ห้ามบอกใคร!</p>
-            <a href="/"><button style="margin-top: 10px;">กลับหน้าหลัก</button></a>
-        </div>
-    `);
+                <p style="color:#666; font-size: 14px;">🤫 เงียบไว้นะ ห้ามบอกใคร!</p>
+                <a href="/"><button style="margin-top: 10px;">กลับหน้าหลัก</button></a>
+            </div>
+        `);
+    } catch (e) {
+        console.error(e);
+        res.send("Error checking results");
+    }
 });
 
 module.exports = app;
