@@ -15,8 +15,11 @@ const ADMIN_PASSWORD = 'Outing_random_buddy'; // 🔑 รหัสเข้า�
 const { createClient } = require('@libsql/client');
 
 const client = createClient({
-    url: process.env.TURSO_DATABASE_URL,
-    authToken: process.env.TURSO_AUTH_TOKEN
+    // url: process.env.TURSO_DATABASE_URL,
+    // authToken: process.env.TURSO_AUTH_TOKEN
+    url: "libsql://random-buddy-vercel-icfg-nczuqhfsb8cspr1kqn1wimj3.aws-ap-northeast-1.turso.io",
+    authToken: "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3Njc5Mjg4MTIsImlkIjoiOTA2MDBkOWYtNGM5ZC00MWFkLTg4Y2QtMTZkNmFlYTYxMDZlIiwicmlkIjoiODdmZGIxNjktODEyMS00MTRiLWIxZGQtZTRmZjNhODBmYjRkIn0.tVK9Vo6bWfuT23TeKVOl2a2YJf1hxiqAlvI0P1Glem6Ljy4LF8xEoZR5hxwm6g1zs3vgzGOavjWosW-DPDa-Aw"
+
 });
 
 // Ensure Tables Exist
@@ -175,6 +178,12 @@ const style = `
         .popup-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
         .popup-box { background: white; padding: 30px; border-radius: 15px; text-align: center; box-shadow: 0 5px 15px rgba(0,0,0,0.3); animation: popin 0.3s; max-width: 300px; width: 90%; }
         @keyframes popin { from { transform: scale(0.8); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .no-copy {
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
     </style>
     <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;500&display=swap" rel="stylesheet">
 `;
@@ -265,7 +274,7 @@ app.get('/', async (req, res) => {
                 </script>
                 <hr>
                 <p>ผู้เข้าร่วม (${users.length} คน):</p>
-                <div>${userList || '- ยังไม่มีคนสมัคร -'}</div>
+                <div class="no-copy">${userList || '- ยังไม่มีคนสมัคร -'}</div>
                 <br>
                 <a href="/admin"><button class="admin-btn">🔒 เข้าสู่ระบบ Admin</button></a>
             </div>
